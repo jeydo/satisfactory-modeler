@@ -496,47 +496,67 @@ function updUndo(){ $('#bUndo').disabled=!hist.length; $('#bRedo').disabled=!red
 function afterLoad(){ if(sel&&!(sel.type==='node'?state.nodes:state.edges).some(x=>x.id===sel.id)) sel=null;
   migrate(state); $('#fname').value=state.name; refresh(); renderProps(); updUndo() }
 
-let saveTimer=null, saving=false, dirty=false;
+let saveTimer=null, saving=false, dirty=false, factories=[], synced=false;
 function setStatus(t){ $('#status').textContent=t }
+function localAll(){ try{ return JSON.parse(localStorage.getItem('sfp-factories')||'{}')||{} }catch(_){ return {} } }
+function localPut(id,doc){ try{ const a=localAll(); a[id]=doc; localStorage.setItem('sfp-factories',JSON.stringify(a)) }catch(_){} }
+function localDel(id){ try{ const a=localAll(); delete a[id]; localStorage.setItem('sfp-factories',JSON.stringify(a)) }catch(_){} }
+const fcol=()=>db.collection('data/users/'+uid);   // une usine = un document data/users/<id>/<usine>
+const online=()=>!!(db&&uid);
+function newId(){ return 'f'+Date.now().toString(36)+Math.random().toString(36).slice(2,6) }
 function changed(){
+  if(!fid) fid=newId();
   try{ localStorage.setItem('sfp-current',JSON.stringify({fid,state})) }catch(_){}
-  if(!db){ setStatus('Enregistré dans ce navigateur'); return }
-  dirty=true; setStatus('Modifications en attente…'); clearTimeout(saveTimer); saveTimer=setTimeout(saveNow,1200);
+  dirty=true; setStatus('Modifications en attente…'); clearTimeout(saveTimer); saveTimer=setTimeout(saveNow,1000);
 }
 async function saveNow(){
-  if(!db||!uid) return; if(saving){ clearTimeout(saveTimer); saveTimer=setTimeout(saveNow,800); return }
-  saving=true; dirty=false;
-  if(!fid) fid='f'+Date.now().toString(36);
-  try{
-    await db.doc(`data/users/${uid}/factories/${fid}`).set({name:state.name||'Sans nom',updatedAt:Date.now(),graph:JSON.stringify(state)});
-    setStatus('Enregistré dans votre compte'); try{ localStorage.setItem('sfp-current',JSON.stringify({fid,state})) }catch(_){}
-    await loadList();
-  }catch(err){ setStatus(err&&err.code==='quota_exceeded'?'Espace plein : supprimez une ancienne usine':'Échec de l\'enregistrement, nouvel essai bientôt'); if(!(err&&err.code==='invalid_argument')) {clearTimeout(saveTimer); saveTimer=setTimeout(saveNow,5000)} else { db=null; setStatus('Enregistré dans ce navigateur') } }
-  saving=false; if(dirty){ clearTimeout(saveTimer); saveTimer=setTimeout(saveNow,800) }
+  if(saving){ clearTimeout(saveTimer); saveTimer=setTimeout(saveNow,800); return }
+  saving=true; dirty=false; if(!fid) fid=newId();
+  const doc={name:state.name||'Sans nom',updatedAt:Date.now(),graph:JSON.stringify(state)};
+  localPut(fid,doc);
+  if(online()){
+    try{ await fcol().doc(fid).set(doc); setStatus('Enregistré dans votre compte') }
+    catch(err){ const c=err&&err.code;
+      if(c==='invalid_argument'||c==='not_granted'||c==='capability_disabled'){ db=null; setStatus('Enregistré dans ce navigateur') }
+      else if(c==='quota_exceeded') setStatus('Espace plein : supprimez une ancienne usine');
+      else { setStatus('Échec de l\'enregistrement, nouvel essai bientôt'); dirty=true } }
+  } else setStatus('Enregistré dans ce navigateur');
+  await loadList(); saving=false;
+  if(dirty){ clearTimeout(saveTimer); saveTimer=setTimeout(saveNow,online()?5000:800) }
 }
-let factories=[];
 async function loadList(){
-  if(!db||!uid){ renderFList(); return }
-  try{ const s=await db.collection(`data/users/${uid}/factories`).orderBy('updatedAt','desc').limit(200).get();
-    factories=s.docs.map(d=>({id:d.id,...d.data()})); }catch(_){ }
+  const map=new Map(Object.entries(localAll()).map(([id,v])=>[id,{id,...v}]));
+  if(online()){
+    try{ const snap=await fcol().limit(500).get();
+      const remote=new Map(snap.docs.map(d=>[d.id,{id:d.id,...d.data()}]));
+      if(!synced){ synced=true; // envoie les usines créées hors ligne
+        for(const [id,l] of map) if(!remote.has(id)){ try{ await fcol().doc(id).set({name:l.name,updatedAt:l.updatedAt,graph:l.graph}) }catch(_){} } }
+      for(const [id,r] of remote){ const l=map.get(id); if(!l||(r.updatedAt||0)>=(l.updatedAt||0)) map.set(id,r) }
+    }catch(_){}
+  }
+  factories=[...map.values()].filter(x=>x&&typeof x.graph==='string').sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0));
   renderFList();
 }
 function renderFList(){
-  const f=$('#flist');
-  if(!db){ f.innerHTML='<option>Ce navigateur</option>'; f.disabled=true; return }
-  f.disabled=false;
-  const cur=factories.some(x=>x.id===fid)?'':`<option value="" selected>${esc(state.name)} (non enregistrée)</option>`;
-  f.innerHTML=cur+factories.map(x=>`<option value="${esc(x.id)}"${x.id===fid?' selected':''}>${esc(x.name)}</option>`).join('')+`<option value="__del">Supprimer l'usine affichée…</option>`;
+  const f=$('#flist'); f.disabled=false;
+  const known=factories.some(x=>x.id===fid);
+  const cur=known?'':`<option value="" selected>${esc(state.name)}${state.nodes.length?' (non enregistrée)':''}</option>`;
+  f.innerHTML=cur+factories.map(x=>`<option value="${esc(x.id)}"${x.id===fid?' selected':''}>${esc(x.name||'Sans nom')}</option>`).join('')+(known?`<option value="__del">Supprimer l'usine affichée…</option>`:'');
 }
 $('#flist').addEventListener('change',async e=>{
   const v=e.target.value;
-  if(v==='__del'){ if(fid&&confirm(`Supprimer « ${state.name} » de votre compte ?`)){ try{ await db.doc(`data/users/${uid}/factories/${fid}`).delete() }catch(_){}
-      fid=null; state=blank(); hist=[];redo=[]; afterLoad(); try{localStorage.removeItem('sfp-current')}catch(_){}; await loadList(); setStatus('Usine supprimée') } else renderFList(); return }
-  const f=factories.find(x=>x.id===v); if(!f) return;
-  if(dirty) await saveNow();
-  try{ state=Object.assign(blank(),JSON.parse(f.graph)); fid=f.id; hist=[];redo=[]; sel=null; afterLoad(); fitView(); try{localStorage.setItem('sfp-current',JSON.stringify({fid,state}))}catch(_){} setStatus('Usine ouverte') }catch(_){ setStatus('Ce fichier d\'usine est illisible') }
+  if(v==='__del'){
+    if(fid&&confirm(`Supprimer « ${state.name} » ?`)){ const id=fid; localDel(id); if(online()){ try{ await fcol().doc(id).delete() }catch(_){} }
+      fid=null; state=blank(); hist=[];redo=[]; sel=null; afterLoad(); try{localStorage.removeItem('sfp-current')}catch(_){}; await loadList(); setStatus('Usine supprimée') }
+    else renderFList();
+    return }
+  const f=factories.find(x=>x.id===v); if(!f){ renderFList(); return }
+  if(dirty){ clearTimeout(saveTimer); await saveNow() }
+  try{ state=migrate(Object.assign(blank(),JSON.parse(f.graph))); fid=f.id; hist=[];redo=[]; sel=null; afterLoad(); fitView();
+    try{localStorage.setItem('sfp-current',JSON.stringify({fid,state}))}catch(_){} setStatus('Usine ouverte') }
+  catch(_){ setStatus('Cette usine est illisible'); renderFList() }
 });
-$('#bNew').addEventListener('click',async()=>{ if(dirty) await saveNow(); fid=null; state=blank(); hist=[];redo=[]; sel=null; view={x:60,y:60,z:1}; applyView(); afterLoad(); renderFList(); setStatus(db?'Nouvelle usine, enregistrée dès la première modification':'Nouvelle usine') });
+$('#bNew').addEventListener('click',async()=>{ if(dirty){ clearTimeout(saveTimer); await saveNow() } fid=null; state=blank(); hist=[];redo=[]; sel=null; view={x:60,y:60,z:1}; applyView(); afterLoad(); renderFList(); setStatus('Nouvelle usine, enregistrée dès la première modification') });
 $('#fname').addEventListener('change',e=>{ pushHist(); state.name=e.target.value.trim()||'Sans nom'; changed(); renderFList() });
 $('#bUndo').addEventListener('click',undo); $('#bRedo').addEventListener('click',redoF);
 
@@ -550,7 +570,7 @@ $('#bImport').addEventListener('click',()=>$('#fileIn').click());
 $('#fileIn').addEventListener('change',async e=>{ const f=e.target.files[0]; if(!f) return;
   try{ const j=JSON.parse(await f.text()); const st=j.factory||j; if(!Array.isArray(st.nodes)||!Array.isArray(st.edges)) throw 0;
     for(const n of st.nodes) if(n.kind==='machine'&&!RECIPES[n.recipe]) throw 0;
-    pushHist(); if(dirty) await saveNow(); fid=null; state=migrate(Object.assign(blank(),st)); sel=null; afterLoad(); fitView(); changed(); renderFList(); setStatus('Usine importée');
+    pushHist(); if(dirty){ clearTimeout(saveTimer); await saveNow() } fid=null; state=migrate(Object.assign(blank(),st)); sel=null; afterLoad(); fitView(); changed(); renderFList(); setStatus('Usine importée');
   }catch(_){ setStatus('Fichier non reconnu : choisissez un JSON exporté depuis ce planificateur') }
   e.target.value='';
 });
@@ -750,17 +770,18 @@ $('#bExample').addEventListener('click',()=>{ pushHist(); state=example(); sel=n
 
 /* ================= Démarrage ================= */
 try{ const c=JSON.parse(localStorage.getItem('sfp-current')||'null'); if(c&&c.state&&Array.isArray(c.state.nodes)){ state=Object.assign(blank(),c.state); fid=c.fid||null } }catch(_){}
-afterLoad(); applyView(); requestAnimationFrame(fitView); renderFList();
+afterLoad(); applyView(); requestAnimationFrame(fitView);
 setStatus('Enregistré dans ce navigateur');
+loadList();
 (async()=>{
   if(!window.claude||typeof window.claude.use!=='function') return;
   try{ downloads=await window.claude.use('downloads') }catch(_){}
   try{
-    const u=await window.claude.use('user'); const d=await window.claude.use('db');
+    const [u,d]=await Promise.all([window.claude.use('user'),window.claude.use('db')]);
     const id=u?await u.id():null;
     if(d&&id){ db=d; uid=id; await loadList();
-      if(!fid&&!state.nodes.length&&factories.length){ const f=factories[0]; try{ state=Object.assign(blank(),JSON.parse(f.graph)); fid=f.id; afterLoad(); fitView() }catch(_){} }
-      renderFList(); setStatus(fid?'Enregistré dans votre compte':'Enregistrement automatique dans votre compte'); }
+      if(!state.nodes.length&&factories.length&&!factories.some(x=>x.id===fid)){ const f=factories[0]; try{ state=migrate(Object.assign(blank(),JSON.parse(f.graph))); fid=f.id; afterLoad(); fitView(); renderFList() }catch(_){} }
+      setStatus('Enregistrement automatique dans votre compte'); }
   }catch(_){}
 })();
 </script>
